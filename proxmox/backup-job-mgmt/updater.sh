@@ -5,61 +5,61 @@
 # ==========================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="${SCRIPT_DIR}/automation.log"
-JOB_ID="$1" # Passed from Cron
+JOB_ID="$1"
 
 # ==========================================
-# MAIN LOGIC
+# FUNCTIONS
 # ==========================================
-
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [UPDATER] [${JOB_ID}] $1" >> "$LOG_FILE"
 }
 
-# 1. Validation
+send_notification() {
+    local msg="$1"
+    if command -v proxmox-notify-client >/dev/null 2>&1; then
+        echo "$msg" | proxmox-notify-client --severity error --type custom --subject "Backup Update Failed: $JOB_ID"
+    else
+        echo "$msg" | mail -s "Backup Update Failed: $JOB_ID" root
+    fi
+}
+
+# ==========================================
+# MAIN LOGIC
+# ==========================================
 if [ -z "$JOB_ID" ]; then
     echo "Error: No Job ID provided."
     exit 1
 fi
 
-log_msg "Starting dynamic update for Job: $JOB_ID"
+log_msg "Starting dynamic update."
 
-# 2. Get Job Details (Find which Node it runs on)
-# We fetch the specific job config
-job_config=$(pvesh get "/cluster/backup/$JOB_ID" --output-format json)
+# 1. Fetch Job Config
+job_json=$(pvesh get "/cluster/backup/$JOB_ID" --output-format json)
 
-# Extract the Node name. If "node" is missing/null, it means "All Nodes" (bad for this logic) or check fails.
-target_node=$(echo "$job_config" | grep -oP '"node":\s*"\K[^"]+')
+# 2. Extract Target Node using Python
+target_node=$(echo "$job_json" | python3 -c "import sys, json; print(json.load(sys.stdin).get('node', ''))")
 
 if [ -z "$target_node" ]; then
-    log_msg "ERROR: Could not find an assigned node for this backup job. Is it set to 'All Nodes'? This script requires jobs assigned to specific nodes."
+    log_msg "ERROR: Job has no specific node assigned (or parsing failed)."
+    send_notification "Job $JOB_ID has no target node or could not be parsed."
     exit 1
 fi
 
-log_msg "Identified target node: $target_node"
+# 3. Fetch Running VMs on that Node
+# Use pvesh + python to get clean comma-separated list of running VMIDs
+running_vms=$(pvesh get "/nodes/$target_node/qemu" --output-format json | python3 -c "import sys, json; print(','.join([x['vmid'] for x in json.load(sys.stdin) if x.get('status') == 'running']))")
 
-# 3. Get Running VMs on that specific node
-# We use pvesh to query the specific node's QEMU list
-# Filter: status == running
-running_vms=$(pvesh get "/nodes/$target_node/qemu" --output-format json | grep -B 2 '"status": "running"' | grep -oP '"vmid":\s*"\K[^"]+' | tr '\n' ',' | sed 's/,$//')
+log_msg "Node: $target_node | Running VMs: [${running_vms}]"
 
-# (Optional) If you use LXC containers, uncomment this to include them too:
-# running_lxc=$(pvesh get "/nodes/$target_node/lxc" --output-format json | grep -B 2 '"status": "running"' | grep -oP '"vmid":\s*"\K[^"]+' | tr '\n' ',' | sed 's/,$//')
-# if [ ! -z "$running_lxc" ]; then running_vms="${running_vms},${running_lxc}"; fi
-
-if [ -z "$running_vms" ]; then
-    log_msg "WARNING: No running VMs found on node $target_node. Clearing backup selection."
-    # We set vmid to empty (or you could skip update to be safe, but empty is correct for 'skip stopped')
-else
-    log_msg "Found running VMs: $running_vms"
-fi
-
-# 4. Update the Backup Job
-# We disable 'all' mode and set the specific vmid list
-# Capture output to check for errors
+# 4. Apply Update
+# Even if list is empty (no running VMs), we update the job to empty list so nothing gets backed up.
 output=$(pvesh set "/cluster/backup/$JOB_ID" --node "$target_node" --all 0 --vmid "$running_vms" 2>&1)
+exit_code=$?
 
-if [ $? -eq 0 ]; then
-    log_msg "SUCCESS: Updated job definition."
+if [ $exit_code -eq 0 ]; then
+    log_msg "SUCCESS: Job definition updated."
 else
-    log_msg "ERROR: Failed to update job. Proxmox returned: $output"
+    log_msg "ERROR: Proxmox API failed: $output"
+    send_notification "Failed to update backup job. Error: $output"
+    exit 1
 fi
