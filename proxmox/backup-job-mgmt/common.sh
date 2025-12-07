@@ -1,150 +1,166 @@
 #!/bin/bash
 
-# --- GLOBAL CONFIGURATION ---
-LOG_FILE="/root/backup-mgmt/automation.log"
-EMAIL_RECIPIENT="andrew.chv@gmail.com"
-# ----------------------------
+# ==========================================
+# COMMON CONFIGURATION
+# ==========================================
+# How many minutes BEFORE the backup schedule should we update the job?
+PADDING_MINUTES=10
 
-# Initialize variable to hold logs for the email body
-RUN_LOG=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="${SCRIPT_DIR}/automation.log"
+PVE_NOTIFY_CFG="/etc/pve/notifications.cfg"
+PVE_PRIV_CFG="/etc/pve/priv/notifications.cfg"
 
-# Shared Logging Function
-# Expects LOG_CONTEXT to be set by the calling script
-log() {
-    local level="$1"
-    local message="$2"
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    local formatted_msg="$timestamp $LOG_CONTEXT [$level] $message"
+# Create a temporary log file for THIS specific run (for email body)
+RUN_LOG=$(mktemp)
+chmod 600 "$RUN_LOG"
+
+# Ensure temp log is removed on script exit
+trap 'rm -f "$RUN_LOG"' EXIT
+
+# ==========================================
+# LOGGING FUNCTIONS
+# ==========================================
+log_msg() {
+    local level="$1"   # INFO, ERROR, WARNING
+    local context="$2" # [MANAGER], [UPDATER] [ID]
+    local msg="$3"
     
-    # Write to file
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local formatted_msg="${timestamp} ${context} [${level}] ${msg}"
+    
+    # Write to persistent log
     echo "$formatted_msg" >> "$LOG_FILE"
     
-    # Store for email
-    RUN_LOG+="$formatted_msg"$'\n'
+    # Write to current run log (for email)
+    echo "$formatted_msg" >> "$RUN_LOG"
     
-    # Output to console
+    # Echo to console
     echo "$formatted_msg"
 }
 
-# Shared Email Notification Function
-# Reads credentials directly from Proxmox config
+log_section() {
+    echo "---------------------------------------------------" >> "$LOG_FILE"
+    echo "---------------------------------------------------" >> "$RUN_LOG"
+    log_msg "INFO" "$1" "$2"
+}
+
+# ==========================================
+# EMAIL NOTIFICATION (Python SMTP)
+# ==========================================
 send_notification() {
-    local status="$1"
-    local job_id_ref="$2" # Optional: Pass JOB_ID if available
-    local subject=""
+    local subject="$1"
+    local severity="$2" # "SUCCESS" or "ERROR"
+    local context_tag="$3"
     
-    # Determine Subject
-    if [ "$status" == "success" ]; then
-        if [ -n "$job_id_ref" ]; then
-            subject="SUCCESS: Backup Automation ($job_id_ref)"
-        else
-            subject="SUCCESS: Backup Manager Run Completed"
-        fi
-    else
-        if [ -n "$job_id_ref" ]; then
-            subject="ERROR: Backup Automation Failed ($job_id_ref)"
-        else
-            subject="ERROR: Backup Manager Run Failed"
-        fi
-    fi
+    local body_content=$(cat "$RUN_LOG")
 
-    log "INFO" "Reading Proxmox notification config and sending email..."
-
-    # Python script to parse Proxmox config and send SMTP
     python3 -c "
-import smtplib
-import ssl
+import sys, re, smtplib, ssl, subprocess, json, socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# --- CONFIG PARSING ---
-def get_smtp_config():
-    config = {'server': '', 'port': 587, 'user': '', 'from': '', 'password': ''}
-    target_name = None
+subject = sys.argv[1]
+severity = sys.argv[2]
+body_log = sys.argv[3]
+public_cfg_path = '$PVE_NOTIFY_CFG'
+priv_cfg_path = '$PVE_PRIV_CFG'
+hostname = socket.gethostname()
+
+def get_user_email(userid):
+    try:
+        cmd = ['pvesh', 'get', f'/access/users/{userid}', '--output-format', 'json']
+        out = subprocess.check_output(cmd).decode('utf-8')
+        data = json.loads(out)
+        return data.get('email')
+    except:
+        return None
+
+def parse_config(path):
+    configs = {}
+    current_section = None
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line_raw = line.rstrip()
+                if not line_raw or line_raw.startswith('#'): continue
+                m_header = re.match(r'^(\w+):\s+(\S+)', line_raw)
+                if m_header:
+                    current_section = m_header.group(2)
+                    configs[current_section] = {'_type': m_header.group(1)}
+                    continue
+                if current_section and (line_raw.startswith(' ') or line_raw.startswith('\t')):
+                    parts = line_raw.strip().split(maxsplit=1)
+                    if len(parts) == 2:
+                        configs[current_section][parts[0]] = parts[1]
+    except FileNotFoundError:
+        pass
+    return configs
+
+def send_mail():
+    public_conf = parse_config(public_cfg_path)
+    priv_conf = parse_config(priv_cfg_path)
+
+    smtp_conf = {}
+    found = False
+    for name, conf in public_conf.items():
+        if conf.get('_type') == 'smtp':
+            smtp_conf = conf
+            if name in priv_conf and 'password' in priv_conf[name]:
+                smtp_conf['password'] = priv_conf[name].get('password')
+            found = True
+            break
+    
+    if not found:
+        print('LOG: No SMTP configuration found.')
+        sys.exit(0) 
+
+    from_addr = smtp_conf.get('from-address', 'root@proxmox')
+    to_addr = smtp_conf.get('username') # Default fallback
+
+    if 'mailto-user' in smtp_conf:
+        for user in smtp_conf['mailto-user'].split(','):
+            email = get_user_email(user.strip())
+            if email:
+                to_addr = email
+                break
+    
+    if not to_addr:
+        print('LOG: No recipient email found.')
+        sys.exit(1)
+
+    msg = MIMEMultipart()
+    msg['From'] = from_addr
+    msg['To'] = to_addr
+    msg['Subject'] = f'[{severity}] Backup Automation: {subject} ({hostname})'
+    msg.attach(MIMEText(f'Execution Report for {hostname}:\n\nSeverity: {severity}\n\nTrace Log:\n{body_log}', 'plain'))
+
+    server_host = smtp_conf.get('server')
+    port = int(smtp_conf.get('port', 465))
+    mode = smtp_conf.get('mode', 'tls')
+    username = smtp_conf.get('username')
+    password = smtp_conf.get('password')
 
     try:
-        # 1. Read Public Config
-        with open('/etc/pve/notifications.cfg', 'r') as f:
-            lines = f.readlines()
-        
-        in_smtp_block = False
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            if line.startswith('smtp:'):
-                in_smtp_block = True
-                target_name = line.split(':')[1].strip()
-                continue
-            elif line.startswith(('sendmail:', 'matcher:')):
-                in_smtp_block = False
-                continue
-
-            if in_smtp_block:
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2:
-                    key, val = parts
-                    if key == 'server': config['server'] = val
-                    if key == 'username': config['user'] = val
-                    if key == 'from-address': config['from'] = val
-
-        # 2. Read Private Config
-        if target_name:
-            with open('/etc/pve/priv/notifications.cfg', 'r') as f:
-                lines = f.readlines()
-            
-            in_smtp_block = False
-            for line in lines:
-                line = line.strip()
-                if not line: continue
-                if line.startswith(f'smtp: {target_name}'):
-                    in_smtp_block = True
-                    continue
-                elif line.startswith(('sendmail:', 'matcher:')) or (line.startswith('smtp:') and target_name not in line):
-                    in_smtp_block = False
-                    continue
-
-                if in_smtp_block and line.startswith('password'):
-                    parts = line.split(maxsplit=1)
-                    if len(parts) == 2:
-                        config['password'] = parts[1]
+        context = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(server_host, port, context=context) as server:
+                if username and password: server.login(username, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(server_host, port) as server:
+                if mode == 'starttls': server.starttls(context=context)
+                if username and password: server.login(username, password)
+                server.send_message(msg)
+        print('EMAIL_SENT')
     except Exception as e:
-        print(f'Error reading config: {e}')
-        exit(1)
-            
-    return config
+        print(f'EMAIL_FAILED: {e}')
+        sys.exit(1)
 
-# --- EXECUTION ---
-cfg = get_smtp_config()
+send_mail()
+" "$subject" "$severity" "$body_content"
 
-if not cfg['server'] or not cfg['password']:
-    print('Error: Could not find valid SMTP configuration in Proxmox files.')
-    exit(1)
-
-sender_email = cfg['from'] if cfg['from'] else cfg['user']
-receiver_email = '$EMAIL_RECIPIENT'
-subject = '$subject'
-body = '''$RUN_LOG'''
-
-message = MIMEMultipart()
-message['From'] = sender_email
-message['To'] = receiver_email
-message['Subject'] = subject
-message.attach(MIMEText(body, 'plain'))
-
-try:
-    context = ssl.create_default_context()
-    with smtplib.SMTP(cfg['server'], int(cfg['port'])) as server:
-        server.starttls(context=context)
-        server.login(cfg['user'], cfg['password'])
-        server.sendmail(sender_email, receiver_email, message.as_string())
-    print('Email sent successfully.')
-except Exception as e:
-    print(f'Error sending email: {e}')
-    exit(1)
-"
-    if [ $? -eq 0 ]; then
-        log "INFO" "SMTP delivery successful."
-    else
-        log "ERROR" "SMTP delivery failed."
+    if [ $? -ne 0 ]; then
+        log_msg "WARNING" "$context_tag" "Failed to send email notification."
     fi
 }
