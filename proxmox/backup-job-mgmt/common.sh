@@ -35,8 +35,10 @@ log_msg() {
     # Write to current run log (for email)
     echo "$formatted_msg" >> "$RUN_LOG"
     
-    # Echo to console
-    echo "$formatted_msg"
+    # Echo to console ONLY if running interactively (Manual Run), NOT via Cron
+    if [ -t 1 ]; then
+        echo "$formatted_msg"
+    fi
 }
 
 log_section() {
@@ -55,7 +57,9 @@ send_notification() {
     
     local body_content=$(cat "$RUN_LOG")
 
-    python3 -c "
+    # Capture output into variable to prevent it from leaking to Cron email
+    local output
+    output=$(python3 -c "
 import sys, re, smtplib, ssl, subprocess, json, socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -112,11 +116,11 @@ def send_mail():
             break
     
     if not found:
-        print('LOG: No SMTP configuration found.')
+        print('LOG|No SMTP configuration found.')
         sys.exit(0) 
 
     from_addr = smtp_conf.get('from-address', 'root@proxmox')
-    to_addr = smtp_conf.get('username') # Default fallback
+    to_addr = smtp_conf.get('username')
 
     if 'mailto-user' in smtp_conf:
         for user in smtp_conf['mailto-user'].split(','):
@@ -126,7 +130,7 @@ def send_mail():
                 break
     
     if not to_addr:
-        print('LOG: No recipient email found.')
+        print('LOG|No recipient email found.')
         sys.exit(1)
 
     msg = MIMEMultipart()
@@ -152,15 +156,18 @@ def send_mail():
                 if mode == 'starttls': server.starttls(context=context)
                 if username and password: server.login(username, password)
                 server.send_message(msg)
-        print('EMAIL_SENT')
+        print('SUCCESS')
     except Exception as e:
-        print(f'EMAIL_FAILED: {e}')
+        print(f'FAIL|{e}')
         sys.exit(1)
 
 send_mail()
-" "$subject" "$severity" "$body_content"
+" "$subject" "$severity" "$body_content" 2>&1)
 
-    if [ $? -ne 0 ]; then
-        log_msg "WARNING" "$context_tag" "Failed to send email notification."
+    # Check the captured output to log internal status
+    if [[ "$output" == "SUCCESS" ]]; then
+        log_msg "INFO" "$context_tag" "Email notification sent successfully."
+    elif [[ "$output" == FAIL* ]]; then
+        log_msg "WARNING" "$context_tag" "Failed to send email: ${output#FAIL|}"
     fi
 }
